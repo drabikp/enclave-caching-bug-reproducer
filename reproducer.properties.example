@@ -1,0 +1,64 @@
+# ============================================================================
+# SQL Server connection
+# ============================================================================
+# The JDBC URL must include:
+#   columnEncryptionSetting=Enabled
+#   enclaveAttestationUrl=<your-attestation-url>
+#   enclaveAttestationProtocol=AAS | HGS
+# It must NOT include:
+#   keyVaultProviderClientId / keyVaultProviderClientKey
+#   (those would create a per-connection provider and bypass our global
+#    registration of the counting provider)
+#
+# Line continuations with '\' are honored by java.util.Properties.
+
+jdbc.url=jdbc:sqlserver://<server>.database.windows.net:1433;\
+database=<database>;\
+encrypt=true;\
+trustServerCertificate=false;\
+columnEncryptionSetting=Enabled;\
+enclaveAttestationUrl=https://<your-attestation>.attest.azure.net/attest/SgxEnclave;\
+enclaveAttestationProtocol=AAS
+
+jdbc.user=<sql_user>
+jdbc.password=<sql_password>
+
+# ============================================================================
+# Azure Key Vault — service principal credentials
+# ============================================================================
+# The principal needs at minimum these permissions on the key:
+#   get, unwrapKey, verify, sign
+# (sign is used by verifyColumnMasterKeyMetadata during enclave attestation)
+
+keyvault.clientId=00000000-0000-0000-0000-000000000000
+keyvault.clientSecret=<service-principal-secret>
+
+# ============================================================================
+# Reproducer parameters
+# ============================================================================
+# Schema and table containing the encrypted column (see setup.sql)
+repro.schema=dbo
+repro.table=EnclaveCachingRepro
+
+# Number of measured iterations in each enclave phase
+repro.iterations=100
+
+# Warmup iterations before each measured run (not counted, but they
+# populate the Azure provider's internal cache so we measure the steady state)
+repro.warmup=2
+
+# Capture MSSQL JDBC driver internal trace logs (java.util.logging, FINER level
+# on com.microsoft.sqlserver.jdbc). Generates one file per run, ready to attach
+# to a Microsoft bug report. Adds non-trivial disk I/O overhead per log record,
+# so consider lowering repro.iterations (e.g. to 5) when this is enabled — the
+# log file gets large at high iteration counts.
+repro.captureJdbcTrace=false
+
+# Where to write the trace log when repro.captureJdbcTrace=true. Relative paths
+# resolve against the working directory.
+repro.jdbcTraceLogPath=mssql-jdbc-trace.log
+
+# Optional: any environment variable named after a property with dots replaced
+# by underscores and uppercased will override the file value. For example:
+#   export JDBC_PASSWORD=...
+#   export KEYVAULT_CLIENTSECRET=...
