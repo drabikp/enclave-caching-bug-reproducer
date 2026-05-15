@@ -1,14 +1,8 @@
 # MSSQL JDBC enclave CEK-caching bug reproducer
 
-Self-contained Maven project that demonstrates a performance bug in the Microsoft JDBC driver for SQL Server: the driver disables the Azure Key Vault provider's internal CEK cache **immediately when the provider is registered globally** (and again on every subsequent non-enclave CEK lookup, as a belt-and-braces). The enclave query path then bypasses the global symmetric-key cache and calls `decryptColumnEncryptionKey` on a cache-disabled provider — every enclave query pays the full `KeyVerify` + `KeyUnwrap` round-trip cost to Azure Key Vault, indefinitely. The bug affects **every application using the recommended global-registration pattern**, including pure-enclave workloads.
+Self-contained Maven project that demonstrates a performance bug in the Microsoft JDBC driver for SQL Server: in Always Encrypted with secure enclaves workloads, the Azure Key Vault provider's internal CEK cache is permanently disabled by the driver itself, and the enclave query path has no caching layer to fall back on — every enclave query pays a Key Vault round-trip, indefinitely.
 
-Confirmed by source inspection in driver versions **12.6.4, 12.10.1, 13.2.0, 13.4.0**. Four lines, identical positions in all four releases:
-
-- `SQLServerConnection.java:1511` — **registration-time poison.** `provider.setColumnEncryptionCacheTtl(Duration.ZERO);` is invoked on every globally registered provider the moment the application calls `SQLServerConnection.registerColumnEncryptionKeyStoreProviders`, with the driver comment "Global providers should not use their own CEK caches." Disables the cache before any query runs.
-- `SQLServerSymmetricKeyCache.java:100` — **per-query poison.** Same call, fired again every time the symmetric key cache misses a CEK. Reached from **both** the non-enclave query path *and* the enclave query path via `ISQLServerEnclaveProvider.java:262` → `SQLServerSecurityUtility.decryptSymmetricKey`. So the very first enclave query with an encrypted parameter re-poisons the cache, even if it was manually restored after registration.
-- `ISQLServerEnclaveProvider.java:229` — **enclave bypass for the enclave's CEK lookup.** `provider.decryptColumnEncryptionKey(...)` is called directly, with no caching layer at all. Once the provider's cache is disabled, every enclave query pays a full Key Vault round-trip here.
-
-Net effect: any application that registers a `KeyStoreProvider` globally has the cache disabled before any query runs, and the only path that could re-enable it (manual restoration) is undone again on the first enclave query with an encrypted parameter. Every enclave query pays a Key Vault round-trip for the enclave's CEK, indefinitely. The bug affects every Always Encrypted + enclave workload using the recommended global-registration pattern.
+This README documents the reproducer itself: what it does, how to run it, and what its output means. Full source citations and root-cause analysis live in the accompanying bug report against `microsoft/mssql-jdbc`.
 
 ## What this reproducer proves
 
@@ -192,13 +186,6 @@ The bug's HTTP signature is unmistakable: in phase 2b's *measured* loop both cou
 `CountingKeyVaultProvider` extends `SQLServerColumnEncryptionKeyStoreProvider`, whose `setColumnEncryptionCacheTtl(Duration)` implementation is an empty no-op (you can confirm in the driver source). If the wrapper inherits that no-op without overriding, the driver's two poison calls (registration-time and per-query) go nowhere — the Azure provider's CEK cache stays intact and phase 3 would look identical to phase 2 (no slowdown). That's the same shielding mechanism our production `CachingKeyVaultProvider` in `encryption-support` uses to *fix* the bug.
 
 For the reproducer to *expose* the bug, `CountingKeyVaultProvider` explicitly overrides `setColumnEncryptionCacheTtl` to forward to the delegate (and count). This single override is the difference between "a wrapper that fixes the bug" and "a wrapper that exposes the bug."
-
-## Customer impact beyond latency
-
-Each affected enclave query consumes **3 or 4 Azure Key Vault HTTP operations** (1 `unwrapkey` + 1 `verify` + 1–2 `key-get` — the actual counts are measured by the reproducer's `KV HTTP counts` line in phase 3). A working cache would consume **zero** in steady state. Two consequences worth flagging in any report:
-
-- **Throttling exposure.** Azure Key Vault enforces a per-vault-per-region budget on key operations. Per the [service limits doc](https://learn.microsoft.com/en-us/azure/key-vault/general/service-limits), that budget is **4,000 ops per 10 s** for RSA 2048 software keys, **2,000** for RSA 2048 HSM, **500** for RSA 3072 HSM, and **250** for RSA 4096 HSM. With this bug, each enclave query consumes 3–4 ops from that budget. An app using HSM-protected RSA 4096 hits the throttling ceiling at roughly **6 enclave queries/sec per vault** — at which point the driver surfaces `429` as a JDBC `SQLServerException`. This is the strongest argument for fixing the bug: it pushes customers into hard rate-limit failures at workload levels the cache would normally absorb completely.
-- **Operating cost.** Azure Key Vault meters cryptographic operations on a per-10K-transaction basis (with separate rates for "Operations" and "Advanced Key Operations" depending on key type/size). The bug multiplies billable KV traffic by 3–4 × the enclave-query rate, where a working cache would have collapsed it to near zero. The exact monthly impact depends on key type, vault tier, and workload volume — see Microsoft's current [Key Vault pricing](https://azure.microsoft.com/pricing/details/key-vault/) — but the multiplier is the workload's enclave-query rate divided by what would have been a handful of cold-cache misses per day.
 
 ## Capturing JDBC trace logs
 
