@@ -2,7 +2,9 @@
 
 Self-contained Maven project that demonstrates a performance bug in the Microsoft JDBC driver for SQL Server: in Always Encrypted with secure enclaves workloads, the Azure Key Vault provider's internal CEK cache is permanently disabled by the driver itself, and the enclave query path has no caching layer to fall back on — every enclave query pays a Key Vault round-trip, indefinitely.
 
-This README documents the reproducer itself: what it does, how to run it, and what its output means. Full source citations and root-cause analysis live in the accompanying bug report against `microsoft/mssql-jdbc`.
+**Bug report:** [microsoft/mssql-jdbc#2957](https://github.com/microsoft/mssql-jdbc/issues/2957). Full source citations, customer impact, and root-cause analysis live there.
+
+This README documents the reproducer itself: what it does, how to run it, and what its output means.
 
 ## What this reproducer proves
 
