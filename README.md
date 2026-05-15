@@ -200,32 +200,12 @@ Each affected enclave query consumes **3 or 4 Azure Key Vault HTTP operations** 
 - **Throttling exposure.** Azure Key Vault enforces a per-vault-per-region budget on key operations. Per the [service limits doc](https://learn.microsoft.com/en-us/azure/key-vault/general/service-limits), that budget is **4,000 ops per 10 s** for RSA 2048 software keys, **2,000** for RSA 2048 HSM, **500** for RSA 3072 HSM, and **250** for RSA 4096 HSM. With this bug, each enclave query consumes 3–4 ops from that budget. An app using HSM-protected RSA 4096 hits the throttling ceiling at roughly **6 enclave queries/sec per vault** — at which point the driver surfaces `429` as a JDBC `SQLServerException`. This is the strongest argument for fixing the bug: it pushes customers into hard rate-limit failures at workload levels the cache would normally absorb completely.
 - **Operating cost.** Azure Key Vault meters cryptographic operations on a per-10K-transaction basis (with separate rates for "Operations" and "Advanced Key Operations" depending on key type/size). The bug multiplies billable KV traffic by 3–4 × the enclave-query rate, where a working cache would have collapsed it to near zero. The exact monthly impact depends on key type, vault tier, and workload volume — see Microsoft's current [Key Vault pricing](https://azure.microsoft.com/pricing/details/key-vault/) — but the multiplier is the workload's enclave-query rate divided by what would have been a handful of cold-cache misses per day.
 
-## Capturing JDBC trace logs for the bug report
+## Capturing JDBC trace logs
 
-Microsoft's bug-report template asks for driver trace logs. The reproducer can generate them for you:
+The reproducer can optionally attach a `java.util.logging` `FileHandler` to the `com.microsoft.sqlserver.jdbc` logger at `FINER`:
 
-1. Set `repro.captureJdbcTrace=true` in `reproducer.properties` (and consider lowering `repro.iterations` to ~5 so the log stays small).
-2. Run the reproducer once. A file named `mssql-jdbc-trace.log` is written to the working directory at MSSQL JDBC's `FINER` level (configured programmatically via `java.util.logging`; nothing extra to put on the command line).
-3. Attach the resulting file to your GitHub issue.
+1. Set `repro.captureJdbcTrace=true` in `reproducer.properties` (and consider lowering `repro.iterations` to ~5 — the trace grows fast).
+2. Run the reproducer once. A file named `mssql-jdbc-trace.log` is written to the working directory; nothing extra needs to go on the command line.
 
-The relevant loggers (under `com.microsoft.sqlserver.jdbc`) emit messages from `SQLServerSymmetricKeyCache.getKey` around each poison call, from the AE parameter-encryption path, and from the enclave provider's `processSDPEv1` — collectively enough for Microsoft to follow the bug step by step in the trace.
+The official documentation for JDBC driver tracing — with full control over loggers and handlers — is at <https://docs.microsoft.com/sql/connect/jdbc/tracing-driver-operation>. Leave `repro.captureJdbcTrace=false` if you'd rather configure it yourself.
 
-If you'd rather configure trace logging yourself (the official mechanism, with full control over loggers and handlers), follow the standard instructions at <https://docs.microsoft.com/sql/connect/jdbc/tracing-driver-operation> and leave `repro.captureJdbcTrace=false`.
-
-## Reporting to Microsoft
-
-When you file the issue against `microsoft/mssql-jdbc`, include:
-
-1. The driver version (`13.4.0.jre11` recommended — latest stable).
-2. `SELECT @@VERSION` output from your SQL Server.
-3. The `setup.sql` schema (with your CMK/CEK names redacted as needed).
-4. This reproducer's stdout output (the `=== Summary ===` block in particular).
-5. Source pointers (lines stable across 12.6.4, 12.10.1, 13.2.0, 13.4.0):
-   - `SQLServerConnection.java:1511` — registration-time poison, with the verbatim driver comment *"Global providers should not use their own CEK caches."*
-   - `SQLServerSymmetricKeyCache.java:100` — per-query poison, with the verbatim comment *"To prevent conflicts between CEK caches, system providers and global providers should not use their own CEK caches."*
-   - `ISQLServerEnclaveProvider.java:229` — direct `provider.decryptColumnEncryptionKey(...)` call (no cache layer) for the enclave's CEK.
-   - `ISQLServerEnclaveProvider.java:262` — call to `SQLServerSecurityUtility.decryptSymmetricKey(...)` for the parameter's CEK, which routes through `SQLServerSymmetricKeyCache.getKey` and re-fires the per-query poison on every enclave query with an encrypted parameter.
-6. The customer-impact notes above (throttling exposure + operating cost), since they materially affect the priority of the fix.
-7. `mssql-jdbc-trace.log` produced by the reproducer with `repro.captureJdbcTrace=true` (or trace logs you've captured via the standard mechanism).
-
-The bug is unambiguous in the driver source; the reproducer's value is in (a) demonstrating user-visible impact quantitatively by comparing against a non-encrypted baseline, (b) showing both poison call sites firing in live execution (phase 1's TTL transition for site #1, phase 3's warmup `setTtl=1` for site #2), and (c) demonstrating that even with manual TTL restoration between phases, the cache is re-disabled on the very first enclave query.
